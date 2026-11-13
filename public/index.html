@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Proximity Voice</title>
+</head>
+<body>
+  <h1>Proximity Voice</h1>
+
+  <input id="name" placeholder="Enter your name">
+  <button id="join">Join room</button>
+  <p id="status"></p>
+
+  <canvas id="map" width="600" height="400" style="border:1px solid black"></canvas>
+  <p>Move with the arrow keys. Walk closer to hear louder.</p>
+
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client@2.24.0/dist/livekit-client.umd.js"></script>
+  <script>
+    
+    const MAX_DIST = 250;   // beyond this distance you hear nothing
+
+    const joinBtn = document.getElementById('join');
+    const nameInput = document.getElementById('name');
+    const statusEl = document.getElementById('status');
+    const canvas = document.getElementById('map');
+    const ctx = canvas.getContext('2d');
+
+    // ---------- Game state ----------
+    const me = { x: 300, y: 200 };
+    const others = {};       // identity -> { x, y }
+    const audioTracks = {};  // identity -> remote audio track
+    const keys = {};         // which keys are held down
+    let room = null;
+
+    // ---------- Distance and volume ----------
+    function distance(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function volumeFromDistance(d) {
+      if (d >= MAX_DIST) return 0;
+      return 1 - d / MAX_DIST;
+    }
+
+    function updateVolumes() {
+      for (const id in audioTracks) {
+        if (!others[id]) continue;   // position not received yet
+        audioTracks[id].setVolume(volumeFromDistance(distance(me, others[id])));
+      }
+    }
+
+    // ---------- Keyboard ----------
+        window.addEventListener('keydown', (e) => {
+      if (document.activeElement === nameInput) return;   // typing a name, don't move
+      if (e.key.startsWith('Arrow')) e.preventDefault();  // stop the page from scrolling
+      keys[e.key] = true;
+    });
+    window.addEventListener('keyup', (e) => { keys[e.key] = false; });
+    window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
+
+    // ---------- Game loop: move + draw ----------
+    function loop() {
+      const speed = 4;
+      if (keys['ArrowLeft']) me.x -= speed;
+      if (keys['ArrowRight']) me.x += speed;
+      if (keys['ArrowUp']) me.y -= speed;
+      if (keys['ArrowDown']) me.y += speed;
+      me.x = Math.max(10, Math.min(canvas.width - 10, me.x));
+      me.y = Math.max(10, Math.min(canvas.height - 10, me.y));
+
+      updateVolumes();
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      // hearing range circle around me
+      ctx.beginPath();
+      ctx.arc(me.x, me.y, MAX_DIST, 0, Math.PI * 2);
+      ctx.strokeStyle = '#bbb';
+      ctx.stroke();
+
+      // other players (red)
+      for (const id in others) {
+        ctx.beginPath();
+        ctx.arc(others[id].x, others[id].y, 10, 0, Math.PI * 2);
+        ctx.fillStyle = 'red';
+        ctx.fill();
+        ctx.fillStyle = 'black';
+        ctx.fillText(id, others[id].x + 14, others[id].y + 4);
+      }
+
+      // me (blue)
+      ctx.beginPath();
+      ctx.arc(me.x, me.y, 10, 0, Math.PI * 2);
+      ctx.fillStyle = 'blue';
+      ctx.fill();
+
+      requestAnimationFrame(loop);
+    }
+    loop();
+
+    // ---------- Send my position 10 times per second ----------
+    setInterval(() => {
+      if (!room || room.state !== 'connected') return;
+      const data = new TextEncoder().encode(JSON.stringify({ x: me.x, y: me.y }));
+      room.localParticipant.publishData(data, { reliable: false, topic: 'pos' });
+    }, 100);
+
+    // ---------- Join room ----------
+    joinBtn.onclick = async () => {
+      const name = nameInput.value.trim();
+      if (!name) return alert('Please enter a name');
+
+      try {
+        if (typeof LivekitClient === 'undefined') {
+          throw new Error('LiveKit library did not load (check internet)');
+        }
+
+        // (1) Ask our server for a token
+        statusEl.textContent = 'Getting token...';
+        const res = await fetch('/token?name=' + encodeURIComponent(name));
+        if (!res.ok) {
+          throw new Error('Token request failed (' + res.status + ')');
+        }
+        const data = await res.json();
+
+        // (2) Create a new room object
+        room = new LivekitClient.Room();
+
+        // (3) When another person's audio arrives, keep it and play it
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+          if (track.kind === 'audio') {
+            audioTracks[participant.identity] = track;
+            track.setVolume(0);   // silent until we know where they are
+            document.body.appendChild(track.attach());
+          }
+        });
+
+        // (4) When another person's position arrives, save it
+        room.on(LivekitClient.RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+          if (topic !== 'pos' || !participant) return;
+          others[participant.identity] = JSON.parse(new TextDecoder().decode(payload));
+        });
+
+        // (5) When someone leaves, remove them
+        room.on(LivekitClient.RoomEvent.ParticipantDisconnected, (participant) => {
+          delete others[participant.identity];
+          delete audioTracks[participant.identity];
+        });
+
+        // (6) Join the room and turn on the microphone
+        statusEl.textContent = 'Connecting...';
+          await room.connect(data.url, data.token);
+        await room.localParticipant.setMicrophoneEnabled(true);
+        statusEl.textContent = name + ' joined the room | Mic is on';
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = 'Error: ' + err.message;
+      }
+    };
+  </script>
+</body>
+</html>
